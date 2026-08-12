@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: busca-processos
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: API_KEY
+        value: busca-processos-dev-key-2024
+      - key: OAB_MOCK_MODE
+        value: ""
+      - key: PYTHONUNBUFFERED
+        value: "1"

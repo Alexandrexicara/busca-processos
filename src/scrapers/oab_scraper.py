@@ -434,6 +434,39 @@ async def _get_v2_token_playwright(estado: str, numero: str) -> Optional[str]:
 
 # ──────────────────────────── Função pública principal ───────────────────────
 
+async def _get_v3_token_headless(estado: str, numero: str) -> Optional[str]:
+    """
+    Tenta obter token reCAPTCHA V3 via chamada direta à API do Google
+    (sem browser). Funciona quando o IP tem score suficiente.
+    """
+    try:
+        v3_site_key = "6LecMcgsAAAAAMfCE4QBHHbHHsKUhCHCDJD4z-Ng"
+        url = f"https://www.google.com/recaptcha/api2/anchor?ar=1&k={v3_site_key}&co=aHR0cHM6Ly9jbmEub2FiLm9yZy5icjo0NDM.&hl=pt-BR&v=rAnd0m&size=invisible&cb=xyz"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+            "Referer": CNA_SITE,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                html = await resp.text()
+                m = re.search(r'"recaptcha-token" value="([^"]+)"', html)
+                if m:
+                    token = m.group(1)
+                    # Trocar pelo token real via reload
+                    reload_url = "https://www.google.com/recaptcha/api2/reload"
+                    data = f"v={v3_site_key}&reason=q&c={token}&k={v3_site_key}&co=aHR0cHM6Ly9jbmEub2FiLm9yZy5icjo0NDM."
+                    async with session.post(reload_url, data=data,
+                                            headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+                                            timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                        body = await r2.text()
+                        m2 = re.search(r'"rresp","([^"]+)"', body)
+                        if m2:
+                            return m2.group(1)
+    except Exception as exc:
+        logger.debug(f"V3 headless falhou: {exc}")
+    return None
+
+
 async def consultar_advogado_oab(
     estado: str,
     numero: str,
@@ -441,11 +474,11 @@ async def consultar_advogado_oab(
     """
     Consulta o CNA/OAB pelo número de inscrição e UF.
 
-    Estratégia:
+    Estratégia (em ordem):
       1. Mock mode (OAB_MOCK_MODE != "") → retorna dado de teste
-      2. Token V2 via 2captcha (TWOCAPTCHA_API_KEY configurado)
-      3. Token V2 via Playwright + solver LLM visual
-      4. Chama API com o token obtido
+      2. Token V2 via 2captcha (TWOCAPTCHA_API_KEY configurado) — recomendado produção
+      3. Token V3 headless (sem browser) — funciona em IPs com bom score
+      4. Token V2 via Playwright + solver LLM visual — requer Xvfb/display
 
     Returns:
         Dict com dados do advogado ou None se não encontrado/falha
@@ -464,27 +497,32 @@ async def consultar_advogado_oab(
 
     logger.info(f"OAB: buscando {estado}/{numero}…")
 
-    # ── Obter token V2 ──────────────────────────────────────────────────────
-    v2_token: Optional[str] = None
-
-    # Opção 1: 2captcha
+    # ── Opção 1: 2captcha (melhor para produção sem display) ────────────────
     v2_token = await _get_token_2captcha()
+    if v2_token:
+        result = await _call_cna_api(estado, numero, v2_token, token_type="v2")
+        if result is not None:
+            logger.info(f"OAB via 2captcha: {result.get('nome')!r}")
+            return result
 
-    # Opção 2: Playwright + LLM
-    if not v2_token:
-        v2_token = await _get_v2_token_playwright(estado, numero)
+    # ── Opção 2: V3 headless (sem browser, IP com bom score) ───────────────
+    v3_token = await _get_v3_token_headless(estado, numero)
+    if v3_token:
+        result = await _call_cna_api(estado, numero, v3_token, token_type="v3")
+        if result is not None:
+            logger.info(f"OAB via V3: {result.get('nome')!r}")
+            return result
 
-    if not v2_token:
-        logger.error("OAB: não foi possível obter token V2 (verificar IP/environment)")
-        return None
+    # ── Opção 3: Playwright + LLM (requer Xvfb) ────────────────────────────
+    v2_token = await _get_v2_token_playwright(estado, numero)
+    if v2_token:
+        result = await _call_cna_api(estado, numero, v2_token, token_type="v2")
+        if result is not None:
+            logger.info(f"OAB via Playwright: {result.get('nome')!r}")
+            return result
 
-    # ── Chamar API ──────────────────────────────────────────────────────────
-    result = await _call_cna_api(estado, numero, v2_token, token_type="v2")
-    if result is not None:
-        logger.info(f"OAB: encontrado {result.get('nome')!r}")
-    else:
-        logger.warning(f"OAB: {estado}/{numero} não encontrado na base")
-    return result
+    logger.error(f"OAB: todas as estratégias falharam para {estado}/{numero}")
+    return None
 
 
 async def buscar_por_oab(estado: str, numero: str) -> Dict[str, Any]:
