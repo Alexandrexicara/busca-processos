@@ -525,21 +525,118 @@ async def consultar_advogado_oab(
     return None
 
 
+async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, Any]]:
+    """
+    Busca processos no DataJud por número de OAB.
+    Consulta todos os tribunais em paralelo.
+    """
+    DATAJUD_URL = "https://api-publica.datajud.cnj.jus.br"
+    DATAJUD_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
+
+    # Tribunais priorizados pelo estado + nacionais
+    estado_tribunal = {
+        "MS": ["api_publica_tjms"], "SP": ["api_publica_tjsp"],
+        "RJ": ["api_publica_tjrj"], "MG": ["api_publica_tjmg"],
+        "RS": ["api_publica_tjrs"], "PR": ["api_publica_tjpr"],
+        "BA": ["api_publica_tjba"], "CE": ["api_publica_tjce"],
+        "GO": ["api_publica_tjgo"], "PE": ["api_publica_tjpe"],
+        "SC": ["api_publica_tjsc"], "MT": ["api_publica_tjmt"],
+        "MA": ["api_publica_tjma"], "PA": ["api_publica_tjpa"],
+        "ES": ["api_publica_tjes"], "RN": ["api_publica_tjrn"],
+        "PB": ["api_publica_tjpb"], "PI": ["api_publica_tjpi"],
+        "SE": ["api_publica_tjse"], "AL": ["api_publica_tjal"],
+        "RO": ["api_publica_tjro"], "AM": ["api_publica_tjam"],
+        "AC": ["api_publica_tjac"], "TO": ["api_publica_tjto"],
+        "AP": ["api_publica_tjap"], "RR": ["api_publica_tjrr"],
+        "DF": ["api_publica_tjdft"],
+    }
+    tribunais_extras = [
+        "api_publica_trf1", "api_publica_trf2", "api_publica_trf3",
+        "api_publica_trf4", "api_publica_trf5",
+        "api_publica_tst", "api_publica_stj",
+    ]
+    tribunais = estado_tribunal.get(estado.upper(), []) + tribunais_extras
+
+    async def buscar_tribunal(tribunal: str) -> List[Dict]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{DATAJUD_URL}/{tribunal}/_search",
+                    headers={
+                        "Authorization": f"APIKey {DATAJUD_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "size": 100,
+                        "query": {
+                            "query_string": {
+                                "query": f"*{numero}*",
+                            }
+                        },
+                        "_source": ["numeroProcesso", "tribunal", "classe",
+                                    "assuntos", "dataAjuizamento", "orgaoJulgador"],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(2)
+                        return []
+                    if not resp.ok:
+                        return []
+                    data = await resp.json(content_type=None)
+                    resultados = []
+                    for hit in data.get("hits", {}).get("hits", []):
+                        f = hit["_source"]
+                        resultados.append({
+                            "numero":   f.get("numeroProcesso", ""),
+                            "tribunal": f.get("tribunal", tribunal.replace("api_publica_", "").upper()),
+                            "classe":   f.get("classe", {}).get("nome", "") if isinstance(f.get("classe"), dict) else "",
+                            "assunto":  (f.get("assuntos") or [{}])[0].get("nome", "") if f.get("assuntos") else "",
+                            "data":     f.get("dataAjuizamento", ""),
+                            "orgao":    f.get("orgaoJulgador", {}).get("nome", "") if isinstance(f.get("orgaoJulgador"), dict) else "",
+                        })
+                    return resultados
+        except Exception as exc:
+            logger.debug(f"DataJud {tribunal}: {exc}")
+            return []
+
+    tarefas = [buscar_tribunal(t) for t in tribunais]
+    resultados_raw = await asyncio.gather(*tarefas, return_exceptions=True)
+
+    unicos: Dict[str, Dict] = {}
+    for lista in resultados_raw:
+        if isinstance(lista, list):
+            for p in lista:
+                if p.get("numero") and p["numero"] not in unicos:
+                    unicos[p["numero"]] = p
+
+    logger.info(f"DataJud OAB {estado}/{numero}: {len(unicos)} processos encontrados")
+    return list(unicos.values())
+
+
 async def buscar_por_oab(estado: str, numero: str) -> Dict[str, Any]:
     """
     Busca completa por número OAB.
+    - Advogado: via CNA/OAB (se reCAPTCHA resolver) ou None
+    - Processos: via DataJud (todos os tribunais, sem reCAPTCHA)
 
     Returns:
         {
             "advogado": {...} | None,
-            "processos": [],
+            "processos": [...],
             "estado": "MS",
             "numero_oab": "3616",
         }
     """
+    # Buscar advogado e processos em paralelo
+    advogado_task  = consultar_advogado_oab(estado, numero)
+    processos_task = _buscar_processos_datajud(estado, numero)
+
+    advogado, processos = await asyncio.gather(advogado_task, processos_task)
+
     return {
-        "advogado":   await consultar_advogado_oab(estado, numero),
-        "processos":  [],
+        "advogado":   advogado,
+        "processos":  processos,
         "estado":     estado.upper(),
         "numero_oab": numero,
     }
