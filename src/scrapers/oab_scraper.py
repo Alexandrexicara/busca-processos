@@ -1,181 +1,507 @@
 """
-Scraper para consulta de advogados via OAB.
-Busca informações do advogado pelo número OAB e estado.
+Scraper para consulta de advogados via CNA/OAB (cna.oab.org.br).
+
+Fluxo de resolução de reCAPTCHA:
+  1. Abre Playwright headful (requer Xvfb em DISPLAY :99)
+  2. Preenche o formulário e clica Pesquisar
+  3. API retorna 428 → Angular renderiza widget reCAPTCHA V2
+  4. Clica no checkbox → Google exibe image challenge
+  5. Screenshot do grid → Claude classifica objetos → clicks nas células corretas
+  6. VERIFY → se aceito, Angular chama API com X-Recaptcha-V2-Token
+  7. Capturamos o token via interceptação e retornamos os dados do advogado
+
+Variáveis de ambiente:
+  DISPLAY             — display Xvfb, padrão :99
+  TWOCAPTCHA_API_KEY  — chave do 2captcha.com (opcional, alternativa ao solver LLM)
+  OAB_MOCK_MODE       — qualquer valor != "" ativa dados de teste sem browser
+  BTY_LLM_SERVER_BASE_URL — gateway LLM (definido pelo ambiente)
+  BTY_LLM_SERVER_API_KEY  — chave do gateway LLM (definido pelo ambiente)
 """
+
+from __future__ import annotations
+
 import asyncio
+import base64
+import json
 import logging
+import os
 import re
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
 
 import aiohttp
-from bs4 import BeautifulSoup
-
-from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# URL da OAB Nacional para consulta
-OAB_CONSULTA_URL = "https://cadastro.oab.org.br/listaadvogado.aspx"
+# ──────────────────────────── Constantes ──────────────────────────────────────
 
-# Mapeamento de estados para códigos OAB
+CNA_SITE          = "https://cna.oab.org.br/"
+CNA_API_BASE      = "https://cna.oab.org.br/cna-interno/api"
+RECAPTCHA_V2_SITE_KEY = "6LcZ0vIrAAAAAGrnTvAlD8c-6sIo8JRf3qG4dMOS"
+
+_CHROMIUM_PATH = (
+    "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome"
+)
+
 ESTADOS_OAB = {
-    "AC": "Acre", "AL": "Alagoas", "AP": "Amapá", "AM": "Amazonas",
-    "BA": "Bahia", "CE": "Ceará", "DF": "Distrito Federal",
-    "ES": "Espírito Santo", "GO": "Goiás", "MA": "Maranhão",
-    "MT": "Mato Grosso", "MS": "Mato Grosso do Sul", "MG": "Minas Gerais",
-    "PA": "Pará", "PB": "Paraíba", "PR": "Paraná", "PE": "Pernambuco",
-    "PI": "Piauí", "RJ": "Rio de Janeiro", "RN": "Rio Grande do Norte",
-    "RS": "Rio Grande do Sul", "RO": "Rondônia", "RR": "Roraima",
-    "SC": "Santa Catarina", "SP": "São Paulo", "SE": "Sergipe",
-    "TO": "Tocantins",
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO",
+    "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI",
+    "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO",
+}
+
+# ──────────────────────────── Mock para desenvolvimento ───────────────────────
+
+_MOCK_DATA: Dict[str, Dict[str, Any]] = {
+    "MS/3616": {
+        "nome": "ADVOGADO TESTE (mock)",
+        "oab": "3616",
+        "uf": "MS",
+        "situacao": "Ativo",
+        "tipo": "Advogado",
+        "email": "",
+        "telefone": "",
+        "subSeccional": "",
+        "raw": {},
+        "fonte": "CNA/OAB (mock)",
+    },
 }
 
 
-def _parse_oab_result(html: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse resultado da consulta OAB.
-    Retorna informações do advogado.
-    """
-    if not html:
+def _get_mock(estado: str, numero: str) -> Optional[Dict[str, Any]]:
+    key = f"{estado.upper()}/{numero.strip()}"
+    return _MOCK_DATA.get(key)
+
+
+# ──────────────────────────── Normalização de resposta ────────────────────────
+
+def _parse_cna_response(data: Any) -> Optional[Dict[str, Any]]:
+    if not data:
         return None
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Tentar encontrar tabela de resultados
-    tabela = soup.find("table", id=re.compile(r"grdAdvogado|grid|tabela|result"))
-    if not tabela:
-        # Tentar encontrar div de resultado
-        resultado = soup.find("div", class_=re.compile(r"result|advogado|dados"))
-        if resultado:
-            texts = resultado.get_text(separator="\n", strip=True)
-            if texts:
-                return {
-                    "nome": texts[:100] if texts else "",
-                    "texto_completo": texts,
-                    "situacao": "Ativo",
-                    "fonte": "OAB",
-                }
+    items: List[dict] = []
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("Items") or []
+        if not items and data.get("nome"):
+            items = [data]
+    elif isinstance(data, list):
+        items = data
+    if not items:
         return None
-
-    # Parse tabela
-    linhas = tabela.find_all("tr")
-    if len(linhas) < 2:
-        return None
-
-    # Cabeçalho
-    cabecalho = linhas[0].find_all(["th", "td"])
-    cols_result = linhas[1].find_all("td")
-
-    if not cols_result:
-        return None
-
-    dados = {}
-    for i, col in enumerate(cabecalho):
-        header = _clean(col.get_text())
-        if i < len(cols_result):
-            dados[header.lower()] = _clean(cols_result[i].get_text())
-
+    adv = items[0]
     return {
-        "nome": dados.get("nome", dados.get("advogado", "")),
-        "oab": dados.get("oab", dados.get("inscrição", "")),
-        "estado": dados.get("estado", dados.get("uf", "")),
-        "situacao": dados.get("situação", "Ativo"),
-        "fonte": "OAB",
+        "nome":        adv.get("nome") or adv.get("Nome") or "",
+        "oab":         adv.get("inscricao") or adv.get("Inscricao") or adv.get("numeroinscricao") or "",
+        "uf":          adv.get("uf") or adv.get("Uf") or adv.get("seccional") or "",
+        "situacao":    adv.get("situacao") or adv.get("Situacao") or adv.get("status") or "Ativo",
+        "tipo":        adv.get("tipoInscricao") or adv.get("TipoInscricao") or "Advogado",
+        "email":       adv.get("email") or adv.get("Email") or "",
+        "telefone":    adv.get("telefone") or adv.get("Telefone") or "",
+        "subSeccional": adv.get("subSeccional") or adv.get("SubSeccional") or "",
+        "raw":         adv,
+        "fonte":       "CNA/OAB",
     }
 
 
-def _clean(text: str) -> str:
-    """Limpa texto."""
-    return re.sub(r"\s+", " ", text).strip()
+# ──────────────────────────── Chamada à API CNA ───────────────────────────────
 
+async def _call_cna_api(
+    estado: str,
+    numero: str,
+    token: str,
+    token_type: str = "v2",   # "v2" | "v3"
+    timeout: int = 20,
+) -> Optional[Dict[str, Any]]:
+    url = f"{CNA_API_BASE}/advogado/search"
+    params = {"Uf": estado.upper(), "TipoInscricao": "1", "Inscricao": numero}
+    base_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Referer": CNA_SITE,
+        "Origin": "https://cna.oab.org.br",
+        "Accept": "application/json, text/plain, */*",
+    }
+    if token_type == "v2":
+        headers = {**base_headers, "X-Recaptcha-V2-Token": token}
+    else:
+        headers = {**base_headers, "X-Recaptcha-Token": token, "X-Recaptcha-Action": "lawyer_search"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                if resp.status == 200:
+                    return _parse_cna_response(await resp.json(content_type=None))
+                if resp.status == 428:
+                    return None  # precisa V2
+                logger.warning(f"CNA API {resp.status}: {await resp.text()[:200]}")
+    except asyncio.TimeoutError:
+        logger.warning("Timeout na API CNA")
+    except Exception as exc:
+        logger.error(f"Erro na API CNA: {exc}")
+    return None
+
+
+# ──────────────────────────── Solver LLM visual ───────────────────────────────
+
+async def _classify_grid_llm(screenshot_b64: str, task: str) -> List[int]:
+    """
+    Envia screenshot do grid ao Claude e retorna índices de células com o objeto pedido.
+    """
+    base_url = os.environ.get("BTY_LLM_SERVER_BASE_URL", "")
+    api_key  = os.environ.get("BTY_LLM_SERVER_API_KEY", "")
+    if not base_url or not api_key:
+        logger.debug("LLM env vars ausentes, sem solver visual")
+        return []
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+        "x-bty-business": "ReActUs",
+        "x-bty-workspace": "default",
+    }
+    body = {
+        "model": "claude-sonnet-4.6",
+        "max_tokens": 100,
+        "stream": False,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"reCAPTCHA image grid challenge. "
+                        f"Task: select all images with '{task}'. "
+                        f"Cells are numbered 0–8 (3×3, left-to-right top-to-bottom) "
+                        f"or 0–15 (4×4). "
+                        f"Reply ONLY with a JSON array of matching cell indices, e.g. [0,3,7] or []. "
+                        f"No explanation."
+                    ),
+                },
+            ],
+        }],
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/messages",
+                headers=headers,
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                text = data.get("content", [{}])[0].get("text", "[]").strip()
+                m = re.search(r"\[[\d,\s]*\]", text)
+                result: List[int] = json.loads(m.group()) if m else []
+                logger.debug(f"LLM classify({task!r}): {result}")
+                return result
+    except Exception as exc:
+        logger.warning(f"Erro no solver LLM: {exc}")
+        return []
+
+
+# ──────────────────────────── Solver via 2captcha ─────────────────────────────
+
+async def _get_token_2captcha() -> Optional[str]:
+    api_key = os.environ.get("TWOCAPTCHA_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        submit_data = {
+            "key": api_key,
+            "method": "userrecaptcha",
+            "googlekey": RECAPTCHA_V2_SITE_KEY,
+            "pageurl": CNA_SITE,
+            "json": "1",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://2captcha.com/in.php",
+                data=submit_data,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("status") != 1:
+                    logger.warning(f"2captcha submit erro: {data}")
+                    return None
+                task_id = data["request"]
+
+            for _ in range(24):
+                await asyncio.sleep(5)
+                async with session.get(
+                    "http://2captcha.com/res.php",
+                    params={"key": api_key, "action": "get", "id": task_id, "json": "1"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    res = await resp.json(content_type=None)
+                    if res.get("status") == 1:
+                        return res["request"]
+                    if res.get("request") != "CAPCHA_NOT_READY":
+                        logger.warning(f"2captcha erro: {res}")
+                        return None
+    except Exception as exc:
+        logger.error(f"Erro 2captcha: {exc}")
+    return None
+
+
+# ──────────────────────────── Solver Playwright + LLM ────────────────────────
+
+async def _get_v2_token_playwright(estado: str, numero: str) -> Optional[str]:
+    """
+    Abre browser headful, resolve reCAPTCHA V2 via LLM visual,
+    e retorna o X-Recaptcha-V2-Token capturado da chamada à API.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.error("playwright não instalado")
+        return None
+
+    display = os.environ.get("DISPLAY", ":99")
+    exec_path = _CHROMIUM_PATH if os.path.isfile(_CHROMIUM_PATH) else None
+
+    token_holder: Dict[str, Optional[str]] = {"token": None}
+    api_status:   Dict[str, Optional[int]]  = {"status": None}
+
+    async with async_playwright() as pw:
+        launch_kw: Dict[str, Any] = {
+            "headless": False,
+            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+            "env": {**os.environ, "DISPLAY": display},
+        }
+        if exec_path:
+            launch_kw["executable_path"] = exec_path
+
+        browser = await pw.chromium.launch(**launch_kw)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1440, "height": 900},
+            locale="en-US",
+        )
+        page = await context.new_page()
+
+        async def _capture_api(response):
+            if "cna-interno" in response.url:
+                api_status["status"] = response.status
+                tok = response.request.headers.get("x-recaptcha-v2-token")
+                if tok:
+                    token_holder["token"] = tok
+                    logger.debug(f"Token V2 capturado: {tok[:30]}…")
+        page.on("response", _capture_api)
+
+        try:
+            await page.goto(CNA_SITE, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(4000)
+            await page.type("input[name='registration']", numero, delay=120)
+            await page.wait_for_timeout(800)
+            await page.select_option("select[name='sectional']", value=estado.upper())
+            await page.wait_for_timeout(800)
+            await page.select_option("select[name='registrationType']", label="Advogado")
+            await page.wait_for_timeout(1500)
+            await page.click("button:has-text('Pesquisar')")
+            await page.wait_for_timeout(6000)
+
+            # Aguardar widget V2
+            iframe_v2 = await page.wait_for_selector("iframe[width='304']", timeout=15000)
+            if not iframe_v2:
+                logger.warning("Widget V2 não apareceu")
+                return None
+
+            bbox = await iframe_v2.bounding_box()
+            if not bbox:
+                return None
+
+            # Clicar no checkbox para abrir challenge
+            await page.mouse.click(bbox["x"] + 24, bbox["y"] + bbox["height"] / 2)
+            await page.wait_for_timeout(5000)
+
+            frames = page.frames
+            bf_frames  = [f for f in frames if "bframe" in f.url]
+            anc_frames = [f for f in frames if "6LcZ0vIr" in f.url and "anchor" in f.url]
+            if not bf_frames:
+                logger.warning("bframe não encontrado")
+                return None
+
+            bf        = bf_frames[0]
+            bframe_el = await page.query_selector("iframe[src*='bframe']")
+
+            # ── Loop de resolução do challenge ──────────────────────────────
+            for attempt in range(25):
+                # Verificar se já resolveu
+                if token_holder["token"]:
+                    break
+                if anc_frames:
+                    checked = await anc_frames[0].evaluate(
+                        "() => document.querySelector('#recaptcha-anchor')?.getAttribute('aria-checked')"
+                    )
+                    if checked == "true":
+                        await page.wait_for_timeout(4000)
+                        break
+
+                info = await bf.evaluate("""() => ({
+                    task:          document.querySelector('.rc-imageselect-desc strong, .rc-imageselect-desc-no-canonical strong')?.innerText?.trim() || '',
+                    has_doscaptcha: !!document.querySelector('.rc-doscaptcha-header'),
+                    has_skip:      !!document.querySelector('.rc-button-default'),
+                    cell_count:    document.querySelectorAll('td.rc-imageselect-tile').length,
+                    is_dynamic:    (document.querySelector('.rc-imageselect-desc')?.innerText || '').includes('none left')
+                })""")
+
+                task       = info.get("task", "").strip()
+                cell_count = info.get("cell_count", 0)
+
+                logger.debug(
+                    f"V2 attempt {attempt + 1}: task={task!r} cells={cell_count} "
+                    f"skip={info.get('has_skip')} dos={info.get('has_doscaptcha')}"
+                )
+
+                if info.get("has_doscaptcha"):
+                    logger.warning("reCAPTCHA rate limit, aguardando 12s…")
+                    await page.wait_for_timeout(12000)
+                    continue
+
+                if not task:
+                    await page.wait_for_timeout(2000)
+                    continue
+
+                # Grids 4×4 → usar SKIP quando disponível
+                if info.get("has_skip") and cell_count == 16:
+                    await bf.click(".rc-button-default", force=True, timeout=5000)
+                    await page.wait_for_timeout(2500)
+                    continue
+
+                # ── Resolver via LLM ────────────────────────────────────────
+                bframe_bbox = await bframe_el.bounding_box()
+                if not bframe_bbox:
+                    await page.wait_for_timeout(2000)
+                    continue
+
+                shot = await page.screenshot(
+                    clip={
+                        "x": bframe_bbox["x"], "y": bframe_bbox["y"],
+                        "width": bframe_bbox["width"], "height": bframe_bbox["height"],
+                    }
+                )
+                indices = await _classify_grid_llm(base64.b64encode(shot).decode(), task)
+
+                if not indices:
+                    # Nenhuma célula correta → verificar (novo challenge ou aprovação)
+                    try:
+                        await bf.click("#recaptcha-verify-button", force=True, timeout=5000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(3000)
+                    continue
+
+                # Clicar nas células corretas via JS (mais confiável que mouse)
+                await bf.evaluate(f"""() => {{
+                    const cells = Array.from(document.querySelectorAll('td.rc-imageselect-tile'));
+                    const idx = {json.dumps(indices)};
+                    idx.forEach(i => {{
+                        if (i < cells.length)
+                            cells[i].dispatchEvent(new MouseEvent('click', {{
+                                bubbles: true, cancelable: true, view: window
+                            }}));
+                    }});
+                }}""")
+                await page.wait_for_timeout(2000)
+
+                # Para challenges dinâmicos, aguardar novas imagens
+                if info.get("is_dynamic"):
+                    await page.wait_for_timeout(2000)
+
+                # Clicar VERIFY
+                try:
+                    await bf.click("#recaptcha-verify-button", force=True, timeout=5000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(4000)
+
+        except Exception as exc:
+            logger.error(f"Erro no Playwright solver: {exc}")
+        finally:
+            await browser.close()
+
+    return token_holder.get("token")
+
+
+# ──────────────────────────── Função pública principal ───────────────────────
 
 async def consultar_advogado_oab(
     estado: str,
     numero: str,
 ) -> Optional[Dict[str, Any]]:
     """
-    Consulta informações de um advogado pela OAB.
+    Consulta o CNA/OAB pelo número de inscrição e UF.
 
-    Args:
-        estado: Sigla do estado (ex: 'SP', 'MS', 'RJ')
-        numero: Número da OAB (ex: '3616', '123456')
-
-    Returns:
-        Dict com informações do advogado ou None
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9",
-    }
-
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            # Primeiro, acessar a página para obter session/cookies
-            async with session.get(OAB_CONSULTA_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Erro ao acessar OAB: status {resp.status}")
-                    return None
-
-            # Montar dados do formulário
-            estado_nome = ESTADOS_OAB.get(estado.upper(), estado)
-
-            payload = {
-                "NomeAdvogado": "",
-                "NumeroInscricao": numero,
-                "Seccional": estado.upper(),
-            }
-
-            async with session.post(OAB_CONSULTA_URL, data=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    return _parse_oab_result(html)
-                else:
-                    logger.warning(f"Erro ao consultar OAB: status {resp.status}")
-
-    except asyncio.TimeoutError:
-        logger.warning("Timeout ao consultar OAB")
-    except Exception as e:
-        logger.error(f"Erro ao consultar OAB: {e}")
-
-    return None
-
-
-async def buscar_por_oab(
-    estado: str,
-    numero: str,
-) -> Dict[str, Any]:
-    """
-    Busca completa por OAB: informações do advogado + processos vinculados.
-
-    Args:
-        estado: Sigla do estado
-        numero: Número OAB
+    Estratégia:
+      1. Mock mode (OAB_MOCK_MODE != "") → retorna dado de teste
+      2. Token V2 via 2captcha (TWOCAPTCHA_API_KEY configurado)
+      3. Token V2 via Playwright + solver LLM visual
+      4. Chama API com o token obtido
 
     Returns:
-        Dict com informações do advogado e processos
+        Dict com dados do advogado ou None se não encontrado/falha
     """
-    resultado = {
-        "advogado": None,
-        "processos": [],
-        "estado": estado.upper(),
+    estado = estado.upper().strip()
+    numero = numero.strip()
+
+    if estado not in ESTADOS_OAB:
+        logger.warning(f"UF inválida: {estado!r}")
+        return None
+
+    # ── Mock mode ───────────────────────────────────────────────────────────
+    if os.environ.get("OAB_MOCK_MODE"):
+        logger.info(f"OAB mock mode: {estado}/{numero}")
+        return _get_mock(estado, numero)
+
+    logger.info(f"OAB: buscando {estado}/{numero}…")
+
+    # ── Obter token V2 ──────────────────────────────────────────────────────
+    v2_token: Optional[str] = None
+
+    # Opção 1: 2captcha
+    v2_token = await _get_token_2captcha()
+
+    # Opção 2: Playwright + LLM
+    if not v2_token:
+        v2_token = await _get_v2_token_playwright(estado, numero)
+
+    if not v2_token:
+        logger.error("OAB: não foi possível obter token V2 (verificar IP/environment)")
+        return None
+
+    # ── Chamar API ──────────────────────────────────────────────────────────
+    result = await _call_cna_api(estado, numero, v2_token, token_type="v2")
+    if result is not None:
+        logger.info(f"OAB: encontrado {result.get('nome')!r}")
+    else:
+        logger.warning(f"OAB: {estado}/{numero} não encontrado na base")
+    return result
+
+
+async def buscar_por_oab(estado: str, numero: str) -> Dict[str, Any]:
+    """
+    Busca completa por número OAB.
+
+    Returns:
+        {
+            "advogado": {...} | None,
+            "processos": [],
+            "estado": "MS",
+            "numero_oab": "3616",
+        }
+    """
+    return {
+        "advogado":   await consultar_advogado_oab(estado, numero),
+        "processos":  [],
+        "estado":     estado.upper(),
         "numero_oab": numero,
     }
-
-    # Buscar informações do advogado
-    advogado_info = await consultar_advogado_oab(estado, numero)
-    resultado["advogado"] = advogado_info
-
-    # Buscar processos vinculados nos tribunais
-    if advogado_info:
-        nome = advogado_info.get("nome", "")
-        if nome:
-            # Importar aqui para evitar circular import
-            from src.scrapers.tribunal_scraper import buscar_por_documento_tribunais
-            processos = await buscar_por_documento_tribunais(
-                tipo_busca="nome",
-                termo=nome,
-            )
-            resultado["processos"] = processos
-
-    return resultado
