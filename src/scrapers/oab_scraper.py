@@ -574,7 +574,9 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                             }
                         },
                         "_source": ["numeroProcesso", "tribunal", "classe",
-                                    "assuntos", "dataAjuizamento", "orgaoJulgador"],
+                                    "assuntos", "dataAjuizamento", "orgaoJulgador",
+                                    "valorCausa", "dataHoraUltimaAtualizacao",
+                                    "partes"],
                     },
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
@@ -587,13 +589,44 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                     resultados = []
                     for hit in data.get("hits", {}).get("hits", []):
                         f = hit["_source"]
+
+                        # Mapear partes (polo ativo e passivo)
+                        partes_raw = f.get("partes") or []
+                        partes = []
+                        for parte in partes_raw:
+                            advs = []
+                            for adv in (parte.get("advogados") or []):
+                                advs.append({
+                                    "nome": adv.get("nome", ""),
+                                    "cpf":  adv.get("cpf", ""),
+                                })
+                            doc_principal = parte.get("documento") or ""
+                            partes.append({
+                                "nome":      parte.get("nome", ""),
+                                "polo":      parte.get("polo", ""),
+                                "tipoPolo":  parte.get("tipoPolo", ""),
+                                "cpf":       doc_principal if len(doc_principal) == 11 else "",
+                                "cnpj":      doc_principal if len(doc_principal) == 14 else "",
+                                "telefone":  parte.get("telefone", ""),
+                                "email":     parte.get("email", ""),
+                                "advogados": advs,
+                            })
+
+                        # Última movimentação
+                        ultima_mov = f.get("dataHoraUltimaAtualizacao", "")
+                        if ultima_mov:
+                            ultima_mov = ultima_mov[:10]  # yyyy-mm-dd
+
                         resultados.append({
-                            "numero":   f.get("numeroProcesso", ""),
-                            "tribunal": f.get("tribunal", tribunal.replace("api_publica_", "").upper()),
-                            "classe":   f.get("classe", {}).get("nome", "") if isinstance(f.get("classe"), dict) else "",
-                            "assunto":  (f.get("assuntos") or [{}])[0].get("nome", "") if f.get("assuntos") else "",
-                            "data":     f.get("dataAjuizamento", ""),
-                            "orgao":    f.get("orgaoJulgador", {}).get("nome", "") if isinstance(f.get("orgaoJulgador"), dict) else "",
+                            "numero":              f.get("numeroProcesso", ""),
+                            "tribunal":            f.get("tribunal", tribunal.replace("api_publica_", "").upper()),
+                            "classe":              f.get("classe", {}).get("nome", "") if isinstance(f.get("classe"), dict) else "",
+                            "assunto":             ", ".join([a.get("nome","") for a in (f.get("assuntos") or [])]),
+                            "data":                f.get("dataAjuizamento", ""),
+                            "orgao":               f.get("orgaoJulgador", {}).get("nome", "") if isinstance(f.get("orgaoJulgador"), dict) else "",
+                            "valor":               f.get("valorCausa", ""),
+                            "dataUltimaMovimentacao": ultima_mov,
+                            "partes":              partes,
                         })
                     return resultados
         except Exception as exc:
