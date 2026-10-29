@@ -216,10 +216,12 @@ async def _buscar_em_tribunal(
                     doc = hits[0]
                     return _parse_documento_datajud(doc, tribunal)
             elif resp.status == 429:
-                logger.warning(f"Rate limit atingido no tribunal {tribunal}")
+                logger.warning("DataJud %s: limite de requisições (429)", tribunal)
                 await asyncio.sleep(2)
+            elif resp.status in (401, 403):
+                logger.error("DataJud %s recusou autenticação (HTTP %s). Confira DATAJUD_API_KEY no ambiente.", tribunal, resp.status)
             elif resp.status != 404:
-                logger.warning(f"Erro {resp.status} no tribunal {tribunal}")
+                logger.warning("DataJud %s retornou HTTP %s", tribunal, resp.status)
     except asyncio.TimeoutError:
         logger.warning(f"Timeout no tribunal {tribunal}")
     except Exception as e:
@@ -269,4 +271,6 @@ async def buscar_por_numero_datajud(
             elif result is not None:
                 resultados.append(result)
 
+    if not resultados and erros:
+        logger.warning("Busca DataJud sem resultados; erros em %s consulta(s).", len(erros))
     return resultados
