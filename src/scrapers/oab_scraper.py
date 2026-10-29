@@ -589,8 +589,15 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                         await asyncio.sleep(2)
                         return []
                     if not resp.ok:
-                        # Registra o status para diferenciar autenticação/endpoint de ausência de processos.
-                        logger.warning("DataJud OAB %s retornou HTTP %s", tribunal, resp.status)
+                        # HTTP 401/403 é falha de autenticação, não uma busca sem resultados.
+                        if resp.status in (401, 403):
+                            logger.error(
+                                "DataJud OAB %s: autenticação recusada (HTTP %s). "
+                                "A consulta não pode ser considerada concluída.",
+                                tribunal, resp.status
+                            )
+                        else:
+                            logger.warning("DataJud OAB %s retornou HTTP %s", tribunal, resp.status)
                         return []
                     data = await resp.json(content_type=None)
                     resultados = []
@@ -650,7 +657,15 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                 if p.get("numero") and p["numero"] not in unicos:
                     unicos[p["numero"]] = p
 
-    logger.info(f"DataJud OAB {estado}/{numero}: {len(unicos)} processos encontrados")
+    if unicos:
+        logger.info("DataJud OAB %s/%s: %s processos encontrados", estado, numero, len(unicos))
+    else:
+        logger.warning(
+            "DataJud OAB %s/%s: nenhum processo retornado. "
+            "Verifique os avisos HTTP acima; HTTP 401/403 significa falha de autenticação, "
+            "não confirmação de que o advogado não possui processos.",
+            estado, numero
+        )
     return list(unicos.values())
 
 
