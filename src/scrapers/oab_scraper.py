@@ -358,29 +358,9 @@ async def consultar_advogado_oab(
 
     logger.info(f"OAB: buscando {estado}/{numero}…")
 
-    # ── Opção 1: 2captcha (melhor para produção sem display) ────────────────
-    v2_token = await _get_token_2captcha()
-    if v2_token:
-        result = await _call_cna_api(estado, numero, v2_token, token_type="v2")
-        if result is not None:
-            logger.info(f"OAB via 2captcha: {result.get('nome')!r}")
-            return result
-
-    # ── Opção 2: V3 headless (sem browser, IP com bom score) ───────────────
-    v3_token = await _get_v3_token_headless(estado, numero)
-    if v3_token:
-        result = await _call_cna_api(estado, numero, v3_token, token_type="v3")
-        if result is not None:
-            logger.info(f"OAB via V3: {result.get('nome')!r}")
-            return result
-
-    # ── Opção 3: Playwright + LLM (requer Xvfb) ────────────────────────────
-    v2_token = await _get_v2_token_playwright(estado, numero)
-    if v2_token:
-        result = await _call_cna_api(estado, numero, v2_token, token_type="v2")
-        if result is not None:
-            logger.info(f"OAB via Playwright: {result.get('nome')!r}")
-            return result
+    # O portal CNA pode exigir validação reCAPTCHA. Não usar serviços externos
+    # nem tentativas automatizadas para contornar essa proteção.
+    await _get_v2_token_playwright(estado, numero)
 
     logger.error(f"OAB: todas as estratégias falharam para {estado}/{numero}")
     return None
