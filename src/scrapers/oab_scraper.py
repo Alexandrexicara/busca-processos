@@ -255,183 +255,42 @@ async def _get_token_2captcha() -> Optional[str]:
 
 async def _get_v2_token_playwright(estado: str, numero: str) -> Optional[str]:
     """
-    Abre browser headful, resolve reCAPTCHA V2 via LLM visual,
-    e retorna o X-Recaptcha-V2-Token capturado da chamada à API.
+    Verifica o acesso ao portal CNA com Chromium/Playwright.
+    Não tenta automatizar nem contornar o reCAPTCHA: quando o portal exige
+    validação humana, a consulta é interrompida e registrada como indisponível.
     """
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        logger.error("playwright não instalado")
+        logger.error("Playwright não está instalado na imagem de produção")
         return None
 
-    display = os.environ.get("DISPLAY", ":99")
-    exec_path = _CHROMIUM_PATH if os.path.isfile(_CHROMIUM_PATH) else None
-
-    token_holder: Dict[str, Optional[str]] = {"token": None}
-    api_status:   Dict[str, Optional[int]]  = {"status": None}
-
-    async with async_playwright() as pw:
-        launch_kw: Dict[str, Any] = {
-            "headless": False,
-            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
-            "env": {**os.environ, "DISPLAY": display},
-        }
-        if exec_path:
-            launch_kw["executable_path"] = exec_path
-
-        browser = await pw.chromium.launch(**launch_kw)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1440, "height": 900},
-            locale="en-US",
-        )
-        page = await context.new_page()
-
-        async def _capture_api(response):
-            if "cna-interno" in response.url:
-                api_status["status"] = response.status
-                tok = response.request.headers.get("x-recaptcha-v2-token")
-                if tok:
-                    token_holder["token"] = tok
-                    logger.debug(f"Token V2 capturado: {tok[:30]}…")
-        page.on("response", _capture_api)
-
-        try:
-            await page.goto(CNA_SITE, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(4000)
-            await page.type("input[name='registration']", numero, delay=120)
-            await page.wait_for_timeout(800)
-            await page.select_option("select[name='sectional']", value=estado.upper())
-            await page.wait_for_timeout(800)
-            await page.select_option("select[name='registrationType']", label="Advogado")
-            await page.wait_for_timeout(1500)
-            await page.click("button:has-text('Pesquisar')")
-            await page.wait_for_timeout(6000)
-
-            # Aguardar widget V2
-            iframe_v2 = await page.wait_for_selector("iframe[width='304']", timeout=15000)
-            if not iframe_v2:
-                logger.warning("Widget V2 não apareceu")
-                return None
-
-            bbox = await iframe_v2.bounding_box()
-            if not bbox:
-                return None
-
-            # Clicar no checkbox para abrir challenge
-            await page.mouse.click(bbox["x"] + 24, bbox["y"] + bbox["height"] / 2)
-            await page.wait_for_timeout(5000)
-
-            frames = page.frames
-            bf_frames  = [f for f in frames if "bframe" in f.url]
-            anc_frames = [f for f in frames if "6LcZ0vIr" in f.url and "anchor" in f.url]
-            if not bf_frames:
-                logger.warning("bframe não encontrado")
-                return None
-
-            bf        = bf_frames[0]
-            bframe_el = await page.query_selector("iframe[src*='bframe']")
-
-            # ── Loop de resolução do challenge ──────────────────────────────
-            for attempt in range(25):
-                # Verificar se já resolveu
-                if token_holder["token"]:
-                    break
-                if anc_frames:
-                    checked = await anc_frames[0].evaluate(
-                        "() => document.querySelector('#recaptcha-anchor')?.getAttribute('aria-checked')"
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+            try:
+                page = await browser.new_page()
+                response = await page.goto(CNA_SITE, wait_until="domcontentloaded", timeout=30000)
+                if response and response.status >= 400:
+                    logger.warning("Portal CNA retornou HTTP %s", response.status)
+                    return None
+                await page.wait_for_timeout(1500)
+                captcha_visible = await page.locator(
+                    "iframe[src*='recaptcha'], iframe[title*='reCAPTCHA']"
+                ).count()
+                if captcha_visible:
+                    logger.warning(
+                        "Portal CNA exige reCAPTCHA. Playwright/Chromium está instalado, "
+                        "mas a consulta automática foi interrompida para não contornar a proteção."
                     )
-                    if checked == "true":
-                        await page.wait_for_timeout(4000)
-                        break
-
-                info = await bf.evaluate("""() => ({
-                    task:          document.querySelector('.rc-imageselect-desc strong, .rc-imageselect-desc-no-canonical strong')?.innerText?.trim() || '',
-                    has_doscaptcha: !!document.querySelector('.rc-doscaptcha-header'),
-                    has_skip:      !!document.querySelector('.rc-button-default'),
-                    cell_count:    document.querySelectorAll('td.rc-imageselect-tile').length,
-                    is_dynamic:    (document.querySelector('.rc-imageselect-desc')?.innerText || '').includes('none left')
-                })""")
-
-                task       = info.get("task", "").strip()
-                cell_count = info.get("cell_count", 0)
-
-                logger.debug(
-                    f"V2 attempt {attempt + 1}: task={task!r} cells={cell_count} "
-                    f"skip={info.get('has_skip')} dos={info.get('has_doscaptcha')}"
-                )
-
-                if info.get("has_doscaptcha"):
-                    logger.warning("reCAPTCHA rate limit, aguardando 12s…")
-                    await page.wait_for_timeout(12000)
-                    continue
-
-                if not task:
-                    await page.wait_for_timeout(2000)
-                    continue
-
-                # Grids 4×4 → usar SKIP quando disponível
-                if info.get("has_skip") and cell_count == 16:
-                    await bf.click(".rc-button-default", force=True, timeout=5000)
-                    await page.wait_for_timeout(2500)
-                    continue
-
-                # ── Resolver via LLM ────────────────────────────────────────
-                bframe_bbox = await bframe_el.bounding_box()
-                if not bframe_bbox:
-                    await page.wait_for_timeout(2000)
-                    continue
-
-                shot = await page.screenshot(
-                    clip={
-                        "x": bframe_bbox["x"], "y": bframe_bbox["y"],
-                        "width": bframe_bbox["width"], "height": bframe_bbox["height"],
-                    }
-                )
-                indices = await _classify_grid_llm(base64.b64encode(shot).decode(), task)
-
-                if not indices:
-                    # Nenhuma célula correta → verificar (novo challenge ou aprovação)
-                    try:
-                        await bf.click("#recaptcha-verify-button", force=True, timeout=5000)
-                    except Exception:
-                        pass
-                    await page.wait_for_timeout(3000)
-                    continue
-
-                # Clicar nas células corretas via JS (mais confiável que mouse)
-                await bf.evaluate(f"""() => {{
-                    const cells = Array.from(document.querySelectorAll('td.rc-imageselect-tile'));
-                    const idx = {json.dumps(indices)};
-                    idx.forEach(i => {{
-                        if (i < cells.length)
-                            cells[i].dispatchEvent(new MouseEvent('click', {{
-                                bubbles: true, cancelable: true, view: window
-                            }}));
-                    }});
-                }}""")
-                await page.wait_for_timeout(2000)
-
-                # Para challenges dinâmicos, aguardar novas imagens
-                if info.get("is_dynamic"):
-                    await page.wait_for_timeout(2000)
-
-                # Clicar VERIFY
-                try:
-                    await bf.click("#recaptcha-verify-button", force=True, timeout=5000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(4000)
-
-        except Exception as exc:
-            logger.error(f"Erro no Playwright solver: {exc}")
-        finally:
-            await browser.close()
-
-    return token_holder.get("token")
+                    return None
+                logger.info("Portal CNA acessível pelo Chromium; não foi emitido token de consulta.")
+                return None
+            finally:
+                await browser.close()
+    except Exception as exc:
+        logger.warning("Verificação do portal CNA com Playwright falhou: %s", exc)
+        return None
 
 
 # ──────────────────────────── Função pública principal ───────────────────────
