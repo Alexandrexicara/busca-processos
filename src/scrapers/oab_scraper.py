@@ -567,7 +567,7 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                 async with session.post(
                     f"{DATAJUD_URL}/{tribunal}/_search",
                     headers={
-                        "Authorization": f"APIKey {DATAJUD_KEY}",
+                        "Authorization": DATAJUD_KEY,
                         "Content-Type": "application/json",
                     },
                     json={
