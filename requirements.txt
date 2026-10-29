@@ -13,5 +13,5 @@ multidict==6.7.1
 propcache==0.5.2
 typing_extensions==4.16.0
 yarl==1.24.5
-# playwright>=1.44.0  # apenas em ambiente local com Xvfb
+playwright==1.55.0  # browser automation for production checks
 python-telegram-bot==21.5
