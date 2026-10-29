@@ -22,7 +22,7 @@ class Settings:
 
     # DataJud API
     DATAJUD_BASE_URL: str = "https://api-publica.datajud.cnj.jus.br"
-    DATAJUD_API_KEY: str = os.getenv("DATAJUD_API_KEY", "APIKey cDZHYzlZa0JadVREZDJCendFbXNpMDI=")
+    DATAJUD_API_KEY: str = os.getenv("DATAJUD_API_KEY", "APIKey cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw==")
 
     # Timeouts
     REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "30"))
