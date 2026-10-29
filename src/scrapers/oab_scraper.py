@@ -395,7 +395,7 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
 
     async def buscar_tribunal(tribunal: str) -> List[Dict]:
         # Sessão por chamada, com poucas tentativas e espera explícita para HTTP 429.
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=12, connect=5, sock_read=8)
         for tentativa in range(3):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -482,8 +482,8 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                 logger.warning("Erro na consulta DataJud OAB %s: %r", tribunal, exc)
                 return []
 
-    # Limita concorrência para não disparar todos os endpoints ao mesmo tempo.
-    sem = asyncio.Semaphore(1)
+    # Consulta poucos tribunais simultaneamente para reduzir o tempo total sem sobrecarregar o DataJud.
+    sem = asyncio.Semaphore(3)
 
     async def buscar_limitado(tribunal: str):
         async with sem:
