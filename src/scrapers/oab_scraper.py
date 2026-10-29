@@ -7,6 +7,8 @@ OAB_MOCK_MODE ativa exclusivamente dados fictícios para desenvolvimento.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import re
