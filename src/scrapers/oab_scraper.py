@@ -1,28 +1,12 @@
 """
-Scraper para consulta de advogados via CNA/OAB (cna.oab.org.br).
-
-Fluxo de resolução de reCAPTCHA:
-  1. Abre Playwright headful (requer Xvfb em DISPLAY :99)
-  2. Preenche o formulário e clica Pesquisar
-  3. API retorna 428 → Angular renderiza widget reCAPTCHA V2
-  4. Clica no checkbox → Google exibe image challenge
-  5. Screenshot do grid → Claude classifica objetos → clicks nas células corretas
-  6. VERIFY → se aceito, Angular chama API com X-Recaptcha-V2-Token
-  7. Capturamos o token via interceptação e retornamos os dados do advogado
-
-Variáveis de ambiente:
-  DISPLAY             — display Xvfb, padrão :99
-  TWOCAPTCHA_API_KEY  — chave do 2captcha.com (opcional, alternativa ao solver LLM)
-  OAB_MOCK_MODE       — qualquer valor != "" ativa dados de teste sem browser
-  BTY_LLM_SERVER_BASE_URL — gateway LLM (definido pelo ambiente)
-  BTY_LLM_SERVER_API_KEY  — chave do gateway LLM (definido pelo ambiente)
+Consulta cadastro CNA/OAB e metadados processuais do DataJud.
+A validação humana eventualmente exigida pelo portal CNA não é contornada.
+OAB_MOCK_MODE ativa exclusivamente dados fictícios para desenvolvimento.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import logging
 import os
 import re
@@ -400,13 +384,12 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
     ]
     tribunais = estado_tribunal.get(estado.upper(), []) + tribunais_extras
 
-    # O número da OAB deve ser procurado no campo de inscrição do advogado,
-    # e não em qualquer campo do processo (o que gera falsos positivos).
-    inscricao_compacta = f"{estado.upper()}{numero.zfill(7)}"
-    query_oab = (
-        f'partes.advogados.inscricao:*{inscricao_compacta}* OR '
-        f'partes.advogados.inscricao:*{estado.upper()}*{numero}*'
-    )
+    # O XSD do CNJ define a inscrição como UF + 7 dígitos + sufixo de tipo.
+    # Usar prefixo com wildcard final inclui o sufixo sem pesquisar outros campos.
+    inscricao_prefixo = f"{estado.upper()}{numero.zfill(7)}"
+    query_oab = f"partes.advogados.inscricao:{inscricao_prefixo}*"
+    logger.info("DataJud OAB: consultando %s tribunais; inscrição iniciada por %s",
+                len(tribunais), inscricao_prefixo)
 
     async def buscar_tribunal(tribunal: str) -> List[Dict]:
         # Sessão por chamada, com poucas tentativas e espera explícita para HTTP 429.
@@ -494,11 +477,11 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                         })
                     return resultados
         except Exception as exc:
-            logger.warning("Erro na consulta DataJud OAB %s: %s", tribunal, exc)
+            logger.warning("Erro na consulta DataJud OAB %s: %r", tribunal, exc)
             return []
 
     # Limita concorrência para não disparar todos os endpoints ao mesmo tempo.
-    sem = asyncio.Semaphore(2)
+    sem = asyncio.Semaphore(1)
 
     async def buscar_limitado(tribunal: str):
         async with sem:
