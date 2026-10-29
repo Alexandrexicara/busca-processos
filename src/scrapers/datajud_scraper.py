@@ -202,8 +202,13 @@ async def _buscar_em_tribunal(
         "size": 10
     }
 
+    # Aceita DATAJUD_API_KEY com ou sem o prefixo exigido pelo DataJud.
+    datajud_api_key = settings.DATAJUD_API_KEY.strip()
+    if datajud_api_key and not datajud_api_key.lower().startswith("apikey "):
+        datajud_api_key = f"APIKey {datajud_api_key}"
+
     headers = {
-        "Authorization": settings.DATAJUD_API_KEY,
+        "Authorization": datajud_api_key,
         "Content-Type": "application/json"
     }
 
