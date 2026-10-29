@@ -400,46 +400,57 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
     ]
     tribunais = estado_tribunal.get(estado.upper(), []) + tribunais_extras
 
+    # O número da OAB deve ser procurado no campo de inscrição do advogado,
+    # e não em qualquer campo do processo (o que gera falsos positivos).
+    inscricao_compacta = f"{estado.upper()}{numero.zfill(7)}"
+    query_oab = (
+        f'partes.advogados.inscricao:*{inscricao_compacta}* OR '
+        f'partes.advogados.inscricao:*{estado.upper()}*{numero}*'
+    )
+
     async def buscar_tribunal(tribunal: str) -> List[Dict]:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{DATAJUD_URL}/{tribunal}/_search",
-                    headers={
-                        "Authorization": DATAJUD_KEY,
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "size": 100,
-                        "query": {
-                            "query_string": {
-                                "query": f"*{numero}*",
-                            }
+        # Sessão por chamada, com poucas tentativas e espera explícita para HTTP 429.
+        timeout = aiohttp.ClientTimeout(total=20)
+        for tentativa in range(3):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{DATAJUD_URL}/{tribunal}/_search",
+                        headers={
+                            "Authorization": DATAJUD_KEY,
+                            "Content-Type": "application/json",
                         },
-                        "_source": ["numeroProcesso", "tribunal", "classe",
-                                    "assuntos", "dataAjuizamento", "orgaoJulgador",
-                                    "valorCausa", "dataHoraUltimaAtualizacao",
-                                    "partes"],
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 429:
-                        logger.warning("DataJud OAB %s: limite de requisições (429)", tribunal)
-                        await asyncio.sleep(2)
-                        return []
-                    if not resp.ok:
-                        # HTTP 401/403 é falha de autenticação, não uma busca sem resultados.
-                        if resp.status in (401, 403):
-                            logger.error(
-                                "DataJud OAB %s: autenticação recusada (HTTP %s). "
-                                "A consulta não pode ser considerada concluída.",
-                                tribunal, resp.status
+                        json={
+                            "size": 25,
+                            "query": {"query_string": {"query": query_oab}},
+                            "_source": ["numeroProcesso", "tribunal", "classe",
+                                        "assuntos", "dataAjuizamento", "orgaoJulgador",
+                                        "valorCausa", "dataHoraUltimaAtualizacao",
+                                        "partes"],
+                        },
+                    ) as resp:
+                        if resp.status == 429:
+                            espera = 2 ** (tentativa + 1)
+                            logger.warning(
+                                "DataJud OAB %s: limite 429; nova tentativa em %ss (%s/3)",
+                                tribunal, espera, tentativa + 1
                             )
-                        else:
-                            logger.warning("DataJud OAB %s retornou HTTP %s", tribunal, resp.status)
-                        return []
-                    data = await resp.json(content_type=None)
-                    resultados = []
+                            if tentativa < 2:
+                                await asyncio.sleep(espera)
+                                continue
+                            return []
+                        if not resp.ok:
+                            if resp.status in (401, 403):
+                                logger.error(
+                                    "DataJud OAB %s: autenticação recusada (HTTP %s). "
+                                    "A consulta não pode ser considerada concluída.",
+                                    tribunal, resp.status
+                                )
+                            else:
+                                logger.warning("DataJud OAB %s retornou HTTP %s", tribunal, resp.status)
+                            return []
+                        data = await resp.json(content_type=None)
+                        resultados = []
                     for hit in data.get("hits", {}).get("hits", []):
                         f = hit["_source"]
 
@@ -486,7 +497,14 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
             logger.warning("Erro na consulta DataJud OAB %s: %s", tribunal, exc)
             return []
 
-    tarefas = [buscar_tribunal(t) for t in tribunais]
+    # Limita concorrência para não disparar todos os endpoints ao mesmo tempo.
+    sem = asyncio.Semaphore(2)
+
+    async def buscar_limitado(tribunal: str):
+        async with sem:
+            return await buscar_tribunal(tribunal)
+
+    tarefas = [buscar_limitado(t) for t in tribunais]
     resultados_raw = await asyncio.gather(*tarefas, return_exceptions=True)
 
     unicos: Dict[str, Dict] = {}
