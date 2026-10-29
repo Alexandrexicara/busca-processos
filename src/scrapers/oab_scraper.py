@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────── Constantes ──────────────────────────────────────
@@ -530,8 +532,10 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
     Busca processos no DataJud por número de OAB.
     Consulta todos os tribunais em paralelo.
     """
-    DATAJUD_URL = "https://api-publica.datajud.cnj.jus.br"
-    DATAJUD_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
+    DATAJUD_URL = settings.DATAJUD_BASE_URL.rstrip("/")
+    DATAJUD_KEY = settings.DATAJUD_API_KEY.strip()
+    if DATAJUD_KEY and not DATAJUD_KEY.lower().startswith("apikey "):
+        DATAJUD_KEY = f"APIKey {DATAJUD_KEY}"
 
     # Tribunais priorizados pelo estado + nacionais
     estado_tribunal = {
@@ -581,9 +585,12 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 429:
+                        logger.warning("DataJud OAB %s: limite de requisições (429)", tribunal)
                         await asyncio.sleep(2)
                         return []
                     if not resp.ok:
+                        # Registra o status para diferenciar autenticação/endpoint de ausência de processos.
+                        logger.warning("DataJud OAB %s retornou HTTP %s", tribunal, resp.status)
                         return []
                     data = await resp.json(content_type=None)
                     resultados = []
@@ -630,7 +637,7 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                         })
                     return resultados
         except Exception as exc:
-            logger.debug(f"DataJud {tribunal}: {exc}")
+            logger.warning("Erro na consulta DataJud OAB %s: %s", tribunal, exc)
             return []
 
     tarefas = [buscar_tribunal(t) for t in tribunais]
