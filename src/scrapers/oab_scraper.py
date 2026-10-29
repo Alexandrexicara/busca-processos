@@ -478,9 +478,9 @@ async def _buscar_processos_datajud(estado: str, numero: str) -> List[Dict[str, 
                             "partes":              partes,
                         })
                     return resultados
-        except Exception as exc:
-            logger.warning("Erro na consulta DataJud OAB %s: %r", tribunal, exc)
-            return []
+            except Exception as exc:
+                logger.warning("Erro na consulta DataJud OAB %s: %r", tribunal, exc)
+                return []
 
     # Limita concorrência para não disparar todos os endpoints ao mesmo tempo.
     sem = asyncio.Semaphore(1)
